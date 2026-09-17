@@ -1890,18 +1890,26 @@ Step::Step(config_defs::joint_id id, ExoData* exo_data)
     : _Controller(id, exo_data)
 {
 #ifdef CONTROLLER_DEBUG
-    Serial.println("Step OPEN LOOP LOADED");
+    Serial.println("Step::Step");
 #endif
 
-    n = 0;
-
+    //Initializes Values
+    n = 1;
+    start_flag = 1;
     start_time = 0;
+    cmd_ff = 0;
     end_time = 0;
 
-    cmd_ff = 0;
+    previous_command = 0;
+    previous_torque_reading = 0;
+    flag = 0;
+    difference = 0;
+    turn = 0;
+    flag_time = 0;
+    change_time = 0;
 
-    state = STEP_ACTIVE;
 }
+
 float Step::calc_motor_cmd()
 {
     
@@ -1956,7 +1964,7 @@ float Step::calc_motor_cmd()
                 end_time = millis();
             }
 
-            if ((t - end_time) >= spacing)
+            if (((current_time - end_time))/1000) >= spacing)
             {
                 n = n + 1;                                          //Update the iteration count
                 start_flag = 1;                                     //Update the start flag to get a new start time and begin a new cycle
@@ -2047,7 +2055,7 @@ float Step::calc_motor_cmd()
     //Sets the desired torque for plotting
     _controller_data->desired_torque = cmd_ff;
 
-    return cmd_ff;
+    return cmd;
 }
 
 /*******************************/
