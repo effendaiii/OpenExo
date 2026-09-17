@@ -3142,4 +3142,805 @@ float PJMC_PLUS::calc_motor_cmd()
     
 	return cmd;
 }
+
+//****************************************************
+
+swingstanceFSRless::swingstanceFSRless(config_defs::joint_id id, ExoData* exo_data)
+: _Controller(id, exo_data)
+{
+    #ifdef CONTROLLER_DEBUG
+        logger::println("swingstanceFSRless::Constructor");
+    #endif
+
+    first_loop = true;
+    second_loop = false;
+
+    encoder_offset = 0.0;
+    encoder_angle = 0.0;
+    prev_encoder_angle = 0.0;
+    norm_angle = 0.0;
+    prev_norm_angle = 0.0;
+    max_angle = 0.0;
+    min_angle = 0.0;
+
+    encoder_vel = 0.0;
+    prev_encoder_vel = 0.0;
+    norm_vel = 0.0;
+    prev_norm_vel = 0.0;
+    max_vel = 0.0;
+    min_vel = 0.0;
+
+    is_stance = true;
+    prev_is_stance = false;
+    check_rising = false;
+    check_sinking = false;
+
+    percent_gait = -2;
+    percent_stance = -2;
+    percent_swing = -2;
+
+    ground_strike_time = 0;
+    toe_off_time = 0;
+
+    angle_threshold = 0.0;
+
+    last_percent_gait = -1;
+    last_start_time = -1;
+
+    prev_cal_flag = _controller_data->parameters[controller_defs::swing_stance_fsrless::cal_flag_idx];
+}
+
+float swingstanceFSRless::calc_motor_cmd()
+{
+    // return to do the work
+	float cmd;
+
+    //float mass = _controller_data->parameters[controller_defs::swing_stance_fsrless::mass_idx];
+    //float stance_setpoint = _controller_data->parameters[controller_defs::swing_stance_fsrless::stance_setpoint_idx];
+    //float swing_setpoint = _controller_data->parameters[controller_defs::swing_stance_fsrless::swing_setpoint_idx];
+
+    float cal_flag = _controller_data->parameters[controller_defs::swing_stance_fsrless::cal_flag_idx];
+
+    //Parameters for determining angle based percent gait
+    unsigned long rising_time = _controller_data->parameters[controller_defs::swing_stance_fsrless::rising_time_idx];
+    float velocity_threshold = _controller_data->parameters[controller_defs::swing_stance_fsrless::velocity_threshold_idx];
+    float angle_alpha = _controller_data->parameters[controller_defs::swing_stance_fsrless::angle_alpha_idx];
+    float vel_alpha = _controller_data->parameters[controller_defs::swing_stance_fsrless::velocity_alpha_idx];
+    correction_factor[0] = _controller_data->parameters[controller_defs::swing_stance_fsrless::K_idx];
+    correction_factor[1] = _controller_data->parameters[controller_defs::swing_stance_fsrless::B_idx];
+
+    // Parameters from FranksCollins Hip Controller
+    float start_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::start_percent_gait_idx];
+
+    float mass = _controller_data->parameters[controller_defs::swing_stance_fsrless::mass_idx];                                               /* User bodymass, currently not used but available if you want to normalize torque mangitude. */
+    float extension_torque_peak = _controller_data->parameters[controller_defs::swing_stance_fsrless::trough_normalized_torque_Nm_kg_idx];    /* Extension torque setpoint. */
+    float flexion_torque_peak = _controller_data->parameters[controller_defs::swing_stance_fsrless::peak_normalized_torque_Nm_kg_idx];        /* Flexion torque setpoint. */
+
+    float extension_torque_magnitude_Nm = -1 * extension_torque_peak;                                                                          /* Sign corrected extension torque magnitude. */
+    float flexion_torque_magnitude_Nm = flexion_torque_peak;                                                                                   /* Sign corrected flexion torque magnitude. */
+
+    float mid_time_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::mid_time_idx];                          /* % gait cycle of the middle of the zero torque region of the curve. */
+    float mid_duration_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::mid_duration_idx];                  /* Duration (in % gait cycle) that zero torque is applied */
+
+    float extension_peak_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::trough_percent_gait_idx];         /* % gait cycle where the extension torque curve starts. */
+    float extension_rise_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::trough_onset_percent_gait_idx];   /* % gait cycle where the extension torque curve peaks. */
+    float extension_fall_percent_gait = (mid_time_percent_gait - (mid_duration_percent_gait / 2)) - extension_peak_percent_gait;              /* % gait cycle where the extension torque curve ends. */
+
+    float flexion_peak_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::peak_percent_gait_idx];             /* % gait cycle where the flexion torque curve starts. */
+    float flexion_rise_percent_gait = flexion_peak_percent_gait - (mid_time_percent_gait + (mid_duration_percent_gait / 2));                  /* % gait cycle where the flexion torque curve peaks. */
+    float flexion_fall_percent_gait = _controller_data->parameters[controller_defs::swing_stance_fsrless::peak_offset_percent_gait_idx];      /* % gait cycle where the flexion torque curve ends. */
+
+    float expected_duration = _controller_data->expected_step_duration;
+    unsigned long curr_time;
+
+    if(first_loop & (_joint_data->motor.enabled)) // check motor is enabled before begining
+    {
+        //Serial.println("entered first loop");
+        start_controller_time = millis();
+        first_loop = false;
+        second_loop = true;
+    }
+    if(second_loop & (_joint_data->motor.p != 0.0)) // calibrate encoders
+    {
+        //Serial.println("entered second loop!!!");
+        calibrate_encoders();
+        normalize_angle();
+        normalize_vel();
+        encoder_angle = _joint_data->position - encoder_offset;
+        prev_encoder_angle = encoder_angle;
+        second_loop = false;
+        _controller_data->encoder_offset = encoder_offset;
+        prev_time = millis();
+    }
+    if((!first_loop) & (!second_loop))
+    {
+        if(prev_cal_flag != cal_flag) // if we need to recal the expected step time
+        {
+            prev_cal_flag = cal_flag;
+            cal_flag = prev_cal_flag;
+            if(!(5000 >= millis() - start_controller_time))
+            {
+                start_controller_time = millis() - 2500;
+            }
+        }
+        if((2500 >= millis() - start_controller_time) && ((millis() - prev_time) >= 5)) // 2.5 seconds to cal just the norm angle and vel
+        {
+            // calibrate angle and derivatives and normalize
+            encoder_angle = _joint_data->position - encoder_offset;
+            encoder_angle = utils::ewma(encoder_angle, prev_encoder_angle, 0.95);
+            curr_time = millis();
+            long_dt = curr_time - prev_time;
+            dt = (float) long_dt;
+            dt = dt / 1000.0;
+            encoder_vel = (encoder_angle - prev_encoder_angle) / dt;
+            encoder_vel = utils::ewma(encoder_vel, prev_encoder_vel, 0.95);
+            normalize_angle();
+            normalize_vel();
+            calc_norms();
+            _controller_data->norm_angle = norm_angle;
+            _controller_data->norm_vel = norm_vel;
+            _controller_data->encoder_angle = encoder_angle;
+            _controller_data->encoder_vel = encoder_vel;
+            _controller_data->desired_torque = 0.0; 
+            
+            //set prev vars to curr vars before next loop
+            prev_time = curr_time; 
+            prev_encoder_angle = encoder_angle;
+            prev_encoder_vel = encoder_vel;
+            prev_ground_strike_time = 0;
+            prev_toe_off_time = 0;
+
+            return 0.0;
+        }
+        else if((5000 >= millis() - start_controller_time) && ((millis() - prev_time) >= 5)) //another 5 seconds to cal expected duration and norm angle and vel
+        {
+            // set up angle and derivative and normalize
+            encoder_angle = _joint_data->position - encoder_offset;
+            encoder_angle = utils::ewma(encoder_angle, prev_encoder_angle, 0.95);
+            curr_time = millis();
+            long_dt = curr_time - prev_time;
+            dt = (float) long_dt;
+            dt = dt / 1000.0;
+            encoder_vel = (encoder_angle - prev_encoder_angle) / dt;
+            encoder_vel = utils::ewma(encoder_vel, prev_encoder_vel, 0.95);
+            normalize_angle();
+            normalize_vel();
+            calc_norms();
+
+            //Determine stance/swing
+            if((norm_vel < -1*velocity_threshold))// & (norm_angle > angle_threshold))
+            {
+                if(!check_sinking) // start clock for continued decrease
+                {
+                    stance_start_sink_time = millis();
+                    check_sinking = true;
+                }
+                if(millis() - stance_start_sink_time >= rising_time)
+                {
+                    is_stance = true;
+                    if(is_stance > prev_is_stance) // switch from swing to stance call heel strike functions
+                    {
+                        prev_ground_strike_time = ground_strike_time;
+                        ground_strike_time = millis();
+                        expected_stance_duration = update_expected_stance_duration();
+                        expected_step_duration = update_expected_duration();
+                    }
+                }
+
+                check_rising = false; // we are decreasing so turn off rising
+            }
+            else if((norm_vel > velocity_threshold))// & (norm_angle < -1*angle_threshold))
+            {
+                if(!check_rising) // start clock for continued increase
+                {
+                    swing_start_rise_time = millis();
+                    check_rising = true;
+                }
+                if(millis() - swing_start_rise_time >= rising_time)
+                {
+                    is_stance = false;
+                    if(is_stance < prev_is_stance) // switch stance to swing all toe off functions
+                    {
+                        prev_toe_off_time = toe_off_time;
+                        toe_off_time = millis();
+                        expected_swing_duration = update_expected_swing_duration();
+                    }
+                }
+                
+                check_sinking = false; // increasing so turn off decreasing
+            }
+            if((expected_step_duration < 500) && (expected_step_duration != 0)) // if step time is too small recal
+            {
+                prev_cal_flag = cal_flag + 1;
+            }
+            calc_percent_gait();
+            calc_percent_stance();
+            calc_percent_swing();
+
+            // save plotting
+            _controller_data->desired_torque = cmd;
+            _controller_data->encoder_angle = encoder_angle;
+            _controller_data->norm_angle = norm_angle;
+            _controller_data->encoder_vel = encoder_vel;
+            _controller_data->norm_vel = norm_vel;
+            _controller_data->is_stance = is_stance;
+            _controller_data->check_rising = check_rising;
+            _controller_data->ff_setpoint = cmd;
+            _controller_data->expected_step_duration = expected_step_duration;
+            _controller_data->expected_stance_duration = expected_stance_duration;
+            _controller_data->expected_swing_duration = expected_swing_duration;
+            _controller_data->percent_gait = percent_gait;
+
+            // set prevs            
+            prev_time = curr_time; 
+            prev_encoder_angle = encoder_angle;
+            prev_encoder_vel = encoder_vel;
+            prev_is_stance = is_stance;
+            prev_cal_flag = cal_flag;
+
+            return 0.0;
+        }
+        else if((millis() - prev_time) >= 5)
+        {
+            rising_time = 0.08 * _controller_data->expected_step_duration; // rising time is now a function of expected step duration
+
+            //Determines the time when the user exceeds the defined startpoint of the shifted gait cycle (done to avoid discontinuties realted to heel strike)
+            if ((percent_gait >= start_percent_gait) && last_percent_gait < start_percent_gait)
+            {
+                last_start_time = millis();
+            }
+
+            //Stores the percent gait for the next loop
+            last_percent_gait = percent_gait;
+
+            // set up angle and derivative and normalize
+            encoder_angle = _joint_data->position - encoder_offset;
+            encoder_angle = utils::ewma(encoder_angle, prev_encoder_angle, 0.95);
+            curr_time = millis();
+            long_dt = curr_time - prev_time;
+            dt = (float) long_dt;
+            dt = dt / 1000.0;
+            encoder_vel = (encoder_angle - prev_encoder_angle) / dt;
+            encoder_vel = utils::ewma(encoder_vel, prev_encoder_vel, 0.95);
+            calc_norms();
+
+            //Determine stance/swing
+            if((norm_vel < -1*velocity_threshold) )//& (norm_angle > angle_threshold))
+            {
+                if(!check_sinking) // start clock for continued decrease
+                {
+                    stance_start_sink_time = millis();
+                    check_sinking = true;
+                }
+                if(millis() - stance_start_sink_time >= rising_time)
+                {
+                    is_stance = true;
+                    if(is_stance > prev_is_stance) // switch swing to stance call heel strike functions
+                    {
+                        prev_ground_strike_time = ground_strike_time;
+                        ground_strike_time = millis();
+                        expected_stance_duration = update_expected_stance_duration();
+                        expected_step_duration = update_expected_duration();
+                        last_start_time = ground_strike_time;
+                        
+                    }
+                }
+
+                check_rising = false; // decreasing so turn off increase clock
+            }
+            else if((norm_vel > velocity_threshold))// & (norm_angle < -1*angle_threshold))
+            {
+                if(!check_rising) // start clock for continued increase
+                {
+                    swing_start_rise_time = millis();
+                    check_rising = true;
+                }
+                if(millis() - swing_start_rise_time >= rising_time)
+                {
+                    is_stance = false;
+                    if(is_stance < prev_is_stance) // switch stance to swing call toe off functions
+                    {
+                        prev_toe_off_time = toe_off_time;
+                        toe_off_time = millis();
+                        expected_swing_duration = update_expected_swing_duration();
+                    }
+                }
+                
+                check_sinking = false; // increasing so turn off decrease clock
+            }
+            if(expected_step_duration < 500) // if too short of a step then recal
+            {
+                prev_cal_flag = cal_flag + 1;
+
+                // save plotting
+                _controller_data->desired_torque = cmd;
+                _controller_data->encoder_angle = encoder_angle;
+                _controller_data->norm_angle = norm_angle;
+                _controller_data->encoder_vel = encoder_vel;
+                _controller_data->norm_vel = norm_vel;
+                _controller_data->is_stance = is_stance;
+                _controller_data->check_rising = check_rising;
+                _controller_data->ff_setpoint = cmd;
+                _controller_data->expected_step_duration = expected_step_duration;
+                _controller_data->expected_stance_duration = expected_stance_duration;
+                _controller_data->expected_swing_duration = expected_swing_duration;
+                _controller_data->percent_gait = percent_gait;
+
+                // set prevs            
+                prev_time = curr_time; 
+                prev_encoder_angle = encoder_angle;
+                prev_encoder_vel = encoder_vel;
+                prev_is_stance = is_stance;
+
+                return 0.0;
+            }
+            percent_gait = calc_percent_gait();
+            percent_stance = calc_percent_stance();
+            percent_swing = calc_percent_swing();
+
+            
+            //Calcualtes the shifted percent gait cycle to avoid discontinuity at heel strike
+            float shifted_percent_gait = (millis() - last_start_time) / expected_step_duration * 100;
+
+            //Calculates the nodes for the flexion and extension curves for spline generation
+            float extension_node1 = extension_peak_percent_gait - extension_rise_percent_gait;
+            float extension_node2 = extension_peak_percent_gait;
+            float extension_node3 = extension_peak_percent_gait + extension_fall_percent_gait;
+
+            float flexion_node1 = flexion_peak_percent_gait - flexion_rise_percent_gait - (100 - start_percent_gait);
+            float flexion_node2 = flexion_peak_percent_gait - (100 - start_percent_gait);
+            float flexion_node3 = flexion_peak_percent_gait + flexion_fall_percent_gait - (100 - start_percent_gait);
+
+            //Calculates the feed-forward command by generating the spline curve based on where the user is estimated to be in their gait cycle
+            cmd = _spline_generation(extension_node1, extension_node2, extension_node3, extension_torque_magnitude_Nm, shifted_percent_gait) + _spline_generation(flexion_node1, flexion_node2, flexion_node3, flexion_torque_magnitude_Nm, percent_gait);
+
+            //Determine if it should be open or closed loop control and calculate accordingly
+            if (_controller_data->parameters[controller_defs::swing_stance_fsrless::use_pid_idx] > 0)
+            {
+                cmd = cmd + _pid(cmd, _controller_data->filtered_torque_reading, _controller_data->parameters[controller_defs::swing_stance_fsrless::p_gain_idx], _controller_data->parameters[controller_defs::swing_stance_fsrless::i_gain_idx], _controller_data->parameters[controller_defs::swing_stance_fsrless::d_gain_idx]);
+            }
+            else
+            {
+                cmd = cmd;
+            }
+
+            // save plotting
+            _controller_data->desired_torque = cmd;
+            _controller_data->encoder_angle = encoder_angle;
+            _controller_data->norm_angle = norm_angle;
+            _controller_data->encoder_vel = encoder_vel;
+            _controller_data->norm_vel = norm_vel;
+            _controller_data->is_stance = is_stance;
+            _controller_data->check_rising = check_rising;
+            _controller_data->ff_setpoint = cmd;
+            _controller_data->expected_step_duration = expected_step_duration;
+            _controller_data->expected_stance_duration = expected_stance_duration;
+            _controller_data->expected_swing_duration = expected_swing_duration;
+            _controller_data->percent_gait = percent_gait;
+
+            // set prevs            
+            prev_time = curr_time; 
+            prev_encoder_angle = encoder_angle;
+            prev_encoder_vel = encoder_vel;
+            prev_is_stance = is_stance;
+            prev_cal_flag = cal_flag;
+
+            //calc encoder offset to apply next iteration
+            //update_encoder_offset();
+
+            return cmd;
+
+        }
+        else //not cal period and too short to calc vel
+        {
+            percent_gait = calc_percent_gait();
+            percent_stance = calc_percent_stance();
+            percent_swing = calc_percent_swing();
+
+            //Calculates the nodes for the flexion and extension curves for spline generation
+            float extension_node1 = extension_peak_percent_gait - extension_rise_percent_gait;
+            float extension_node2 = extension_peak_percent_gait;
+            float extension_node3 = extension_peak_percent_gait + extension_fall_percent_gait;
+
+            float flexion_node1 = flexion_peak_percent_gait - flexion_rise_percent_gait - (100 - start_percent_gait);
+            float flexion_node2 = flexion_peak_percent_gait - (100 - start_percent_gait);
+            float flexion_node3 = flexion_peak_percent_gait + flexion_fall_percent_gait - (100 - start_percent_gait);
+
+            //Calcualtes the shifted percent gait cycle to avoid discontinuity at heel strike
+            float shifted_percent_gait = (millis() - last_start_time) / expected_step_duration * 100;
+
+            //Calculates the feed-forward command by generating the spline curve based on where the user is estimated to be in their gait cycle
+            cmd = _spline_generation(extension_node1, extension_node2, extension_node3, extension_torque_magnitude_Nm, shifted_percent_gait) + _spline_generation(flexion_node1, flexion_node2, flexion_node3, flexion_torque_magnitude_Nm, percent_gait);
+
+            //Determine if it should be open or closed loop control and calculate accordingly
+            if (_controller_data->parameters[controller_defs::swing_stance_fsrless::use_pid_idx] > 0)
+            {
+                cmd = cmd + _pid(cmd, _controller_data->filtered_torque_reading, _controller_data->parameters[controller_defs::swing_stance_fsrless::p_gain_idx], _controller_data->parameters[controller_defs::swing_stance_fsrless::i_gain_idx], _controller_data->parameters[controller_defs::swing_stance_fsrless::d_gain_idx]);
+            }
+            else
+            {
+                cmd = cmd;
+            }
+
+            return cmd;
+        }
+    }
+    else
+    {
+        // motors not enabled
+        return 0.0;
+    }
+}
+
+void swingstanceFSRless::calibrate_encoders()
+{
+    float sum_encoder_readings = 0.0;                                        
+    for (int i = 0; i < 5; i++)
+    {
+       sum_encoder_readings += _joint_data->position;
+    }
+    encoder_offset = sum_encoder_readings/5;
+    encoder_offset_0 = sum_encoder_readings/5;
+}
+
+void swingstanceFSRless::update_encoder_offset() //function to determine the encoder offset 
+{
+    // THIS FUNCTION IS NOT CURRENTLY USED
+    float cmd = _controller_data->desired_torque;
+    //calc encoder offset to apply next iteration
+    /*
+    prev_encoder_offset = encoder_offset - encoder_offset_0;
+    // Serial.print("curr time: ");
+    // Serial.println(millis());
+    // Serial.print("prev time: ");
+    // Serial.println(prev_time);
+    // Serial.print("detla time: ");
+    // Serial.println(dt);
+    // Serial.print("K: ");
+    // Serial.println(correction_factor[0]);
+    // Serial.print("B: ");
+    // Serial.println(correction_factor[1]);
+    // Serial.print("torque: ");
+    // Serial.println(cmd);
+    encoder_offset = correction_factor[0] * prev_encoder_offset;
+    // Serial.print("K * delta Theta: ");
+    // Serial.println(encoder_offset);
+    encoder_offset = cmd - encoder_offset;
+    // Serial.print("Tau - K * delta Theta: ");
+    // Serial.println(encoder_offset);
+    encoder_offset = encoder_offset / correction_factor[1];
+    // Serial.print("tau - K * delta Theta / B: ");
+    // Serial.println(encoder_offset);
+    encoder_offset = encoder_offset * dt;
+    // Serial.print("tau - K * delta Theta / B * dt: ");
+    // Serial.println(encoder_offset);
+    // encoder_offset = utils::ewma(encoder_offset, prev_encoder_offset, _controller_data->parameters[controller_defs::angle_based::offset_alpha_idx]);
+    // Serial.print("unscaled encoder offset: ");
+    // Serial.println(encoder_offset);
+    encoder_offset = encoder_offset + encoder_offseet_0;
+    */
+   encoder_offset = cmd/correction_factor[0];
+}
+
+float swingstanceFSRless::_spline_generation(float node1, float node2, float node3, float torque_magnitude, float shifted_percent_gait)
+{
+    float u;
+
+    float x[3] = {node1, node2, node3};
+    float y[3] = {0, torque_magnitude, 0};
+
+    float h[2] = { (x[1] - x[0]), (x[2] - x[1]) };
+    float delta[2] = { ((y[1] - y[0]) / h[0]), ((y[2] - y[1]) / h[1]) };
+
+    float dy[3] = { 0, 0, 0};
+
+    if (shifted_percent_gait < x[0] || shifted_percent_gait > x[2])
+    {
+       u = 0;
+    }
+    else
+    {
+        int k = - 1;
+        if (shifted_percent_gait >= x[0] && shifted_percent_gait < (x[1]))
+        {
+            k = 0;
+        }
+        else if (shifted_percent_gait >= x[1] && shifted_percent_gait < x[2])
+        {
+            k = 1;
+        }
+
+        float a = delta[k];
+        float b = (a - dy[k]) / h[k];
+        float c = (dy[k + 1] - a) / h[k];
+        float d = (c - b) / h[k];
+
+        u = y[k] + (shifted_percent_gait - x[k]) * (dy[k] + (shifted_percent_gait - x[k]) * (b + (shifted_percent_gait - x[k + 1]) * d));
+    }
+
+    return u;
+}
+
+void swingstanceFSRless::normalize_angle()
+{
+    if (encoder_angle > max_angle)
+    {
+        max_angle = encoder_angle;
+    }
+    if (encoder_angle < min_angle)
+    {
+        min_angle = encoder_angle;
+    }
+}
+
+void swingstanceFSRless::normalize_vel()
+{
+    if (encoder_vel > max_vel)
+    {
+        max_vel = encoder_vel;
+    }
+    if (encoder_vel < min_vel)
+    {
+        min_vel = encoder_vel;
+    }
+    _controller_data->max_vel = max_vel;
+    _controller_data->min_vel = min_vel;
+}
+
+void swingstanceFSRless::calc_norms()
+{
+    if (encoder_angle > 0.0)
+    {
+        norm_angle = encoder_angle/max_angle;
+    }
+    if (encoder_angle <= 0.0)
+    {
+        norm_angle = -1*encoder_angle/min_angle;
+    }
+    if (encoder_vel > 0.0)
+    {
+        norm_vel = encoder_vel/max_vel;
+    }
+    if (encoder_vel <= 0.0)
+    {
+        norm_vel = -1*encoder_vel/min_vel;
+    }
+}
+
+float swingstanceFSRless::calc_percent_gait()
+{
+    int timestamp = millis();
+    int percent_gait = -1;
+    
+    //Only calulate if the expected step duration has been established.
+    if (expected_step_duration > 0)
+    {
+        percent_gait = 100 * ((float)timestamp - ground_strike_time) / expected_step_duration;
+        percent_gait = min(percent_gait, 100); //Set saturation.
+        
+        // logger::print("Side::_calc_percent_gait : percent_gait_x10 = ");
+        // logger::print(percent_gait_x10);
+        // logger::print("\n");
+    }
+    return percent_gait;
+}
+
+float swingstanceFSRless::calc_percent_stance()
+{
+    int timestamp = millis();
+    int percent_stance = -1;
+    
+    //Only calulate if the expected stance duration has been established.
+    if (expected_stance_duration > 0)
+    {
+        percent_stance = 100 * ((float)timestamp - ground_strike_time) / expected_stance_duration;
+        percent_stance = min(percent_stance, 100); //Set saturation.
+    }
+
+    if (is_stance == 0)
+    {
+        percent_stance = 0;
+    }
+    return percent_stance;
+}
+
+float swingstanceFSRless::calc_percent_swing()
+{
+    int timestamp = millis();
+    int percent_swing = -1;
+    
+    //Only calulate if the expected swing duration has been established.
+    if (expected_stance_duration > 0)
+    {
+        percent_swing = 100 * ((float)timestamp - toe_off_time) / expected_swing_duration;
+        percent_swing = min(percent_swing, 100); //Set saturation.
+        
+        // logger::print("Side::_calc_percent_gait : percent_gait_x10 = ");
+        // logger::print(percent_gait_x10);
+        // logger::print("\n");
+    }
+    return percent_swing;
+}
+
+float swingstanceFSRless::update_expected_duration()
+{
+    unsigned int step_time = ground_strike_time - prev_ground_strike_time;
+    float expected_step_duration = _controller_data->expected_step_duration;
+		
+    if (0 == prev_ground_strike_time) //If the prev time isn't set just return.
+    {
+        return expected_step_duration;
+    }
+
+    uint8_t num_uninitialized = 0;
+    
+    //Check that everything is set.
+    for (int i = 0; i < num_steps_avg; i++)
+    {
+        num_uninitialized += (step_times[i] == 0);
+    }
+    
+    //Get the max and min values of the array for determining the window for expected values.
+    unsigned int* max_val = std::max_element(step_times, step_times + num_steps_avg);
+    unsigned int* min_val = std::min_element(step_times, step_times + num_steps_avg);
+    
+    if  (num_uninitialized > 0)  //If all the values haven't been replaced
+    {
+        //Shift all the values and insert the new one
+        for (int i = (num_steps_avg - 1); i>0; i--)
+        {
+            step_times[i] = step_times[i-1];
+        }
+        step_times[0] = step_time;
+        
+        // logger::print("Side::_update_expected_duration : _step_times not fully initialized- [\t");
+        // for (int i = 0; i < num_steps_avg; i++)
+        // {
+            // logger::print(_step_times[i]);
+            // logger::print("\t");
+        // }
+        // logger::print("\t]\n");    
+    }
+
+    //Consider it a good step if the ground strike falls within a window around the expected duration. Then shift the step times and put in the new value.
+    else if ((step_time <= (expected_duration_window_upper_coeff * *max_val)) & (step_time >= (expected_duration_window_lower_coeff * *min_val))) // and (armed_time > ARMED_DURATION_PERCENT * self.expected_duration)): # a better check can be used.  If the person hasn't stopped or the step is good update the vector.  
+    {
+        int sum_step_times = step_time;
+        for (int i = (num_steps_avg - 1); i>0; i--)
+        {
+            sum_step_times += step_times[i-1];
+            step_times[i] = step_times[i-1];
+        }
+        step_times[0] = step_time;
+        
+        expected_step_duration = sum_step_times / num_steps_avg;  //Average to the nearest ms
+        
+        // logger::print("Side::_update_expected_duration : _expected_step_duration - ");
+        // logger::print(_expected_step_duration);
+        // logger::print("\n");
+    }
+    return step_time; // return expecte_step_duration to get moving average, this returns on the most recent step time
+}
+
+float swingstanceFSRless::update_expected_stance_duration()
+{
+    unsigned int stance_time = toe_off_time - ground_strike_time;
+    float expected_stance_duration = _controller_data->expected_stance_duration;
+
+    if (0 == prev_ground_strike_time) //If the prev time isn't set just return.
+    {
+        return expected_stance_duration;
+    }
+    
+    uint8_t num_uninitialized = 0;
+    
+    //Check that everything is set.
+    for (int i = 0; i < num_steps_avg; i++)
+    {
+        num_uninitialized += (stance_times[i] == 0);
+    }
+
+    //Get the max and min values of the array for determining the window for expected values.
+    unsigned int* max_val = std::max_element(stance_times, stance_times + num_steps_avg);
+    unsigned int* min_val = std::min_element(stance_times, stance_times + num_steps_avg);
+
+    if (num_uninitialized > 0)  //If all the values haven't been replaced
+    {
+        //Shift all the values and insert the new one
+        for (int i = (num_steps_avg - 1); i>0; i--)
+        {
+            stance_times[i] = stance_times[i - 1];
+        }
+        stance_times[0] = stance_time;
+
+        // logger::print("Side::_update_expected_duration : _step_times not fully initialized- [\t");
+        // for (int i = 0; i < num_steps_avg; i++)
+        // {
+            // logger::print(_step_times[i]);
+            // logger::print("\t");
+        // }
+        // logger::print("\t]\n");
+    }
+
+    //Consider it a good step if the ground strike falls within a window around the expected duration. Then shift the step times and put in the new value.
+    else if ((stance_time <= (expected_duration_window_upper_coeff * *max_val)) & (stance_time >= (expected_duration_window_lower_coeff * *min_val))) // and (armed_time > ARMED_DURATION_PERCENT * self.expected_duration)): # a better check can be used.  If the person hasn't stopped or the step is good update the vector.  
+    {
+        int sum_stance_times = stance_time;
+        for (int i = (num_steps_avg - 1); i>0; i--)
+        {
+            sum_stance_times += stance_times[i - 1];
+            stance_times[i] = stance_times[i - 1];
+        }
+        stance_times[0] = stance_time;
+
+        expected_stance_duration = sum_stance_times / num_steps_avg;  //Average to the nearest ms
+        
+        // logger::print("Side::_update_expected_duration : _expected_step_duration - ");
+        // logger::print(_expected_step_duration);
+        // logger::print("\n");
+    }
+    return expected_stance_duration;
+};
+
+
+float swingstanceFSRless::update_expected_swing_duration()
+{
+    unsigned int swing_time = ground_strike_time - toe_off_time;
+    float expected_swing_duration = _controller_data->expected_swing_duration;
+
+    if (0 == prev_toe_off_time) //If the prev time isn't set just return.
+    {
+        return expected_swing_duration;
+    }
+
+    uint8_t num_uninitialized = 0;
+    
+    //Check that everything is set.
+    for (int i = 0; i < num_steps_avg; i++)
+    {
+        num_uninitialized += (swing_times[i] == 0);
+    }
+
+    //Get the max and min values of the array for determining the window for expected values.
+    unsigned int* max_val = std::max_element(swing_times, swing_times + num_steps_avg);
+    unsigned int* min_val = std::min_element(swing_times, swing_times + num_steps_avg);
+
+    if (num_uninitialized > 0)  //If all the values haven't been replaced
+    {
+        //Shift all the values and insert the new one
+        for (int i = (num_steps_avg-1); i>0; i--)
+        {
+            swing_times[i] = swing_times[i - 1];
+        }
+        swing_times[0] = swing_time;
+
+        // logger::print("Side::_update_expected_duration : _step_times not fully initialized- [\t");
+        // for (int i = 0; i < _num_steps_avg; i++)
+        // {
+            // logger::print(_step_times[i]);
+            // logger::print("\t");
+        // }
+        // logger::print("\t]\n");
+    }
+    
+    //Consider it a good step if the ground strike falls within a window around the expected duration. Then shift the step times and put in the new value.
+    else if ((swing_time <= (expected_duration_window_upper_coeff * *max_val)) & (swing_time >= (expected_duration_window_lower_coeff * *min_val))) // and (armed_time > ARMED_DURATION_PERCENT * self.expected_duration)): # a better check can be used.  If the person hasn't stopped or the step is good update the vector.  
+    {
+        int sum_swing_times = swing_time;
+        for (int i = (num_steps_avg - 1); i>0; i--)
+        {
+            sum_swing_times += swing_times[i - 1];
+            swing_times[i] = swing_times[i - 1];
+        }
+        swing_times[0] = swing_time;
+
+        expected_swing_duration = sum_swing_times / num_steps_avg;  //Average to the nearest ms
+        
+        // logger::print("Side::_update_expected_duration : _expected_step_duration - ");
+        // logger::print(_expected_step_duration);
+        // logger::print("\n");
+    }
+    return expected_swing_duration;
+}
+
 #endif
