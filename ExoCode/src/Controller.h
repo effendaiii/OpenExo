@@ -21,7 +21,7 @@
 #include "ParseIni.h"
 #include <stdint.h>
 #include "Utilities.h"
-#include "config.h"
+#include "Config.h"
 #include "Time_Helper.h"
 #include <algorithm>
 #include <utility>

@@ -35,7 +35,7 @@
 #if defined(ARDUINO_TEENSY36)  || defined(ARDUINO_TEENSY41)
 #include "Arduino.h"
 #include "Board.h"
-#include "config.h"
+#include "Config.h"
 //#include "IntervalTimer.h"
 
 //Define the on and off state of the LED. This is handy for if you are using a P Channel MOSFET where low is on.

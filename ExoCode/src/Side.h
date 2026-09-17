@@ -16,8 +16,8 @@
 
 #include "Arduino.h"
 
-#include "joint.h"
-#include "controller.h"
+#include "Joint.h"
+#include "Controller.h"
 #include "FSR.h"
 #include "ParseIni.h"
 #include "Board.h"
