@@ -1964,7 +1964,7 @@ float Step::calc_motor_cmd()
                 end_time = millis();
             }
 
-            if (((current_time - end_time))/1000) >= spacing)
+            if (((current_time - end_time))/1000) >= Spacing)
             {
                 n = n + 1;                                          //Update the iteration count
                 start_flag = 1;                                     //Update the start flag to get a new start time and begin a new cycle
