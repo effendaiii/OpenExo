@@ -22,7 +22,7 @@ namespace ini_config
     const int buffer_length = 500;  /**< Length of the buffer for reading the file. */
     const int key_length = 25;      /**< Max length of the key name */
     const int section_length = 10;  /**< Max length of the section name */
-    const int number_of_keys = 71;  /**< Number of keys to be parsed. */
+    const int number_of_keys = 84;  /**< Number of keys to be parsed. */
 }
 
 //Reading the ini file from the SD card; 1 is the lowest value to confirm that data is present for sending over SPI
@@ -340,6 +340,20 @@ namespace config_defs
     static const int right_arm_1_torque_offset_idx = 68;
     static const int left_arm_2_torque_offset_idx = 69;
     static const int right_arm_2_torque_offset_idx = 70;
+
+    static const int max_torque_rate_in_idx = 71;
+    static const int max_torque_rate_in_cycle_limit_idx = 72;
+    static const int max_torque_in_idx = 73;
+    static const int max_torque_in_cycle_limit_idx = 74;
+    static const int max_desired_torque_idx = 75;
+    static const int max_desired_torque_cycle_limit_idx = 76;
+    static const int max_desired_torque_rate_idx = 77;
+    static const int max_desired_torque_rate_cycle_limit_idx = 78;
+    static const int max_driver_torque_idx = 79;
+    static const int max_driver_torque_cycle_limit_idx = 80;
+    static const int max_driver_torque_rate_idx = 81;
+    static const int max_driver_torque_rate_cycle_limit_idx = 82;
+    static const int static_driver_torque_cycle_limit_idx = 83;
 }
 
 #if defined(ARDUINO_TEENSY36)  || defined(ARDUINO_TEENSY41) 
@@ -370,6 +384,15 @@ namespace config_defs
      * @param pointer to the uint8_t array to be updated with the encoded parameter info. Array should be ini_config::number_of_keys in length
      */
     void ini_parser(char* filename, uint8_t* config_to_send); //uses sent filename
+
+    /**
+     * @brief Writes encoded config bytes to SD config.ini (overwrites existing file).
+     *
+     * @param config_to_write pointer to encoded config array (ini_config::number_of_keys length)
+     * @param filename path to ini file (default: /config.ini)
+     * @return true if file was written, false otherwise
+     */
+    bool write_ini_config(const uint8_t* config_to_write, const char* filename = "/config.ini");
     
     /**
      * @brief Retrieve the key values and print the output
@@ -672,6 +695,19 @@ namespace config_defs
         float left_arm_2_torque_offset;
         float right_arm_2_torque_offset;
 		
+        float max_sensor_torque;
+        uint8_t max_sensor_torque_cycle_limit;
+        uint16_t max_sensor_torque_rate;
+        uint8_t max_sensor_torque_rate_cycle_limit;
+        float max_desired_torque;
+        uint8_t max_desired_torque_cycle_limit;
+        uint16_t max_desired_torque_rate;
+        uint8_t max_desired_torque_rate_cycle_limit;
+        float max_driver_torque;
+        uint8_t max_driver_torque_cycle_limit;
+        uint16_t max_driver_torque_rate;
+        uint8_t max_driver_torque_rate_cycle_limit;
+        uint8_t static_driver_torque_cycle_limit;
     };
 #endif
 
